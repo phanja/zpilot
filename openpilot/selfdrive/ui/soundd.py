@@ -4,7 +4,7 @@ import time
 import wave
 
 
-from cereal import car, messaging, custom
+from openpilot.cereal import log, messaging, custom
 from openpilot.common.basedir import BASEDIR
 from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.realtime import Ratekeeper
@@ -12,7 +12,7 @@ from openpilot.common.utils import retry
 from openpilot.common.swaglog import cloudlog
 
 from openpilot.system import micd
-from openpilot.system.hardware import HARDWARE
+from openpilot.common.hardware import HARDWARE
 
 from openpilot.sunnypilot.selfdrive.ui.quiet_mode import QuietMode
 
@@ -32,7 +32,7 @@ if HARDWARE.get_device_type() == "tizi":
   AMBIENT_DB = 30
   VOLUME_BASE = 10
 
-AudibleAlert = car.CarControl.HUDControl.AudibleAlert
+AudibleAlert = log.SelfdriveState.AudibleAlert
 AudibleAlertSP = custom.SelfdriveStateSP.AudibleAlert
 
 
@@ -48,12 +48,14 @@ sound_list: dict[int, tuple[str, int | None, float]] = {
   AudibleAlert.disengage: ("disengage.wav", 1, MAX_VOLUME),
   AudibleAlert.refuse: ("refuse.wav", 1, MAX_VOLUME),
 
-  AudibleAlert.prompt: ("prompt.wav", 1, MAX_VOLUME),
-  AudibleAlert.promptRepeat: ("prompt.wav", None, MAX_VOLUME),
-  AudibleAlert.promptDistracted: ("prompt_distracted.wav", None, MAX_VOLUME),
+  AudibleAlert.prompt: ("warning.wav", 1, MAX_VOLUME),
+  AudibleAlert.promptRepeat: ("warning.wav", None, MAX_VOLUME),
+  AudibleAlert.promptDistracted: ("dm_warning.wav", None, MAX_VOLUME),
 
-  AudibleAlert.warningSoft: ("warning_soft.wav", None, MAX_VOLUME),
-  AudibleAlert.warningImmediate: ("warning_immediate.wav", None, MAX_VOLUME),
+  AudibleAlert.preAlert: ("pre_alert.wav", 1, MAX_VOLUME),
+
+  AudibleAlert.warningSoft: ("critical.wav", None, MAX_VOLUME),
+  AudibleAlert.warningImmediate: ("dm_critical.wav", None, MAX_VOLUME),
 
   **sound_list_sp,
 }
