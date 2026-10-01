@@ -4,7 +4,7 @@ import time
 import wave
 
 
-from openpilot.cereal import log, messaging, custom
+from cereal import car, messaging, custom
 from openpilot.common.basedir import BASEDIR
 from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.realtime import Ratekeeper
@@ -12,7 +12,7 @@ from openpilot.common.utils import retry
 from openpilot.common.swaglog import cloudlog
 
 from openpilot.system import micd
-from openpilot.common.hardware import HARDWARE
+from openpilot.system.hardware import HARDWARE
 
 from openpilot.sunnypilot.selfdrive.ui.quiet_mode import QuietMode
 
@@ -24,7 +24,7 @@ ALERT_RAMP_TIME = 4 # seconds to ramp to max volume for warningImmediate
 SELFDRIVE_STATE_TIMEOUT = 5 # 5 seconds
 FILTER_DT = 1. / (micd.SAMPLE_RATE / micd.FFT_SAMPLES)
 
-AMBIENT_DB = 26 # DB where MIN_VOLUME is applied
+AMBIENT_DB = 24 # DB where MIN_VOLUME is applied
 DB_SCALE = 30 # AMBIENT_DB + DB_SCALE is where MAX_VOLUME is applied
 
 VOLUME_BASE = 20
@@ -32,7 +32,7 @@ if HARDWARE.get_device_type() == "tizi":
   AMBIENT_DB = 30
   VOLUME_BASE = 10
 
-AudibleAlert = log.SelfdriveState.AudibleAlert
+AudibleAlert = car.CarControl.HUDControl.AudibleAlert
 AudibleAlertSP = custom.SelfdriveStateSP.AudibleAlert
 
 
@@ -48,17 +48,20 @@ sound_list: dict[int, tuple[str, int | None, float]] = {
   AudibleAlert.disengage: ("disengage.wav", 1, MAX_VOLUME),
   AudibleAlert.refuse: ("refuse.wav", 1, MAX_VOLUME),
 
-  AudibleAlert.prompt: ("warning.wav", 1, MAX_VOLUME),
-  AudibleAlert.promptRepeat: ("warning.wav", None, MAX_VOLUME),
-  AudibleAlert.promptDistracted: ("dm_warning.wav", None, MAX_VOLUME),
+  AudibleAlert.prompt: ("prompt.wav", 1, MAX_VOLUME),
+  AudibleAlert.promptRepeat: ("prompt.wav", None, MAX_VOLUME),
+  AudibleAlert.promptDistracted: ("prompt_distracted.wav", None, MAX_VOLUME),
 
-  AudibleAlert.preAlert: ("pre_alert.wav", 1, MAX_VOLUME),
-
-  AudibleAlert.warningSoft: ("critical.wav", None, MAX_VOLUME),
-  AudibleAlert.warningImmediate: ("dm_critical.wav", None, MAX_VOLUME),
+  AudibleAlert.warningSoft: ("warning_soft.wav", None, MAX_VOLUME),
+  AudibleAlert.warningImmediate: ("warning_immediate.wav", None, MAX_VOLUME),
 
   **sound_list_sp,
 }
+if HARDWARE.get_device_type() == "tizi":
+  sound_list.update({
+    AudibleAlert.engage: ("engage_tizi.wav", 1, MAX_VOLUME),
+    AudibleAlert.disengage: ("disengage_tizi.wav", 1, MAX_VOLUME),
+  })
 
 def check_selfdrive_timeout_alert(sm):
   ss_missing = time.monotonic() - sm.recv_time['selfdriveState']
@@ -80,6 +83,150 @@ class Soundd(QuietMode):
     self.current_volume = MIN_VOLUME
     self.current_sound_frame = 0
 
+    self.ramp_start_volume = MIN_VOLUME
+    self.ramp_start_time = 0.
+
+    self.selfdrive_timeout_alert = False
+
+    self.spl_filter_weighted = FirstOrderFilter(0, 2.5, FILTER_DT, initialized=False)
+
+  def load_sounds(self):
+    self.loaded_sounds: dict[int, np.ndarray] = {}
+
+    # Load all sounds
+    for sound in sound_list:
+      filename, play_count, volume = sound_list[sound]
+
+      with wave.open(BASEDIR + "/selfdrive/assets/sounds/" + filename, 'r') as wavefile:
+        assert wavefile.getnchannels() == 1
+        assert wavefile.getsampwidth() == 2
+        assert wavefile.getframerate() == SAMPLE_RATE
+
+        length = wavefile.getnframes()
+        self.loaded_sounds[sound] = np.frombuffer(wavefile.readframes(length), dtype=np.int16).astype(np.float32) / (2**16/2)
+
+  def get_sound_data(self, frames): # get "frames" worth of data from the current alert sound, looping when required
+
+    ret = np.zeros(frames, dtype=np.float32)
+
+    if self.should_play_sound(self.current_alert):
+      num_loops = sound_list[self.current_alert][1]
+      sound_data = self.loaded_sounds[self.current_alert]
+      written_frames = 0
+
+      current_sound_frame = self.current_sound_frame % len(sound_data)
+      loops = self.current_sound_frame // len(sound_data)
+
+      while written_frames < frames and (num_loops is None or loops < num_loops):
+        available_frames = sound_data.shape[0] - current_sound_frame
+        frames_to_write = min(available_frames, frames - written_frames)
+        ret[written_frames:written_frames+frames_to_write] = sound_data[current_sound_frame:current_sound_frame+frames_to_write]
+        written_frames += frames_to_write
+        self.current_sound_frame += frames_to_write
+
+    return ret * self.current_volume
+
+  def callback(self, data_out: np.ndarray, frames: int, time, status) -> None:
+    if status:
+      cloudlog.warning(f"soundd stream over/underflow: {status}")
+    data_out[:frames, 0] = self.get_sound_data(frames)
+
+  def update_alert(self, new_alert):
+    current_alert_played_once = self.current_alert == AudibleAlert.none or self.current_sound_frame > len(self.loaded_sounds[self.current_alert])
+    if self.current_alert != new_alert and (new_alert != AudibleAlert.none or current_alert_played_once):
+      if new_alert == AudibleAlert.warningImmediate:
+        self.ramp_start_volume = self.current_volume
+        self.ramp_start_time = time.monotonic()
+      self.current_alert = new_alert
+      self.current_sound_frame = 0
+
+  def get_audible_alert(self, sm):
+    if sm.updated['selfdriveState']:
+      new_alert = sm['selfdriveState'].alertSound.raw
+      self.update_alert(new_alert)
+    elif check_selfdrive_timeout_alert(sm):
+      self.update_alert(AudibleAlert.warningImmediate)
+      self.selfdrive_timeout_alert = True
+    elif self.selfdrive_timeout_alert:
+      self.update_alert(AudibleAlert.none)
+      self.selfdrive_timeout_alert = False
+
+  def calculate_volume(self, weighted_db):
+    volume = ((weighted_db - AMBIENT_DB) / DB_SCALE) * (MAX_VOLUME - MIN_VOLUME) + MIN_VOLUME
+    return math.pow(VOLUME_BASE, (np.clip(volume, MIN_VOLUME, MAX_VOLUME) - 1))
+
+  @retry(attempts=60, delay=3)
+  def get_stream(self, sd):
+    # reload sounddevice to reinitialize portaudio
+    sd._terminate()
+    sd._initialize()
+    # Wait for a valid default output device before opening the stream to avoid
+    # transient PortAudio "Error querying device -1" during boot.
+    deadline = time.monotonic() + 30.0
+    output_device_index = None
+    while time.monotonic() < deadline:
+      try:
+        default = sd.default.device
+        if isinstance(default, (list, tuple)) and len(default) >= 2 and default[1] is not None and default[1] != -1:
+          output_device_index = default[1]
+          break
+        # fall back to ALSA host API default if available
+        for ha in sd.query_hostapis():
+          if ha.get('name') == 'ALSA' and ha.get('default_output_device', -1) != -1:
+            output_device_index = ha['default_output_device']
+            break
+        if output_device_index is not None:
+          break
+      except Exception:
+        # keep waiting until deadline
+        pass
+      time.sleep(0.5)
+
+    if output_device_index is None:
+      raise RuntimeError("Audio output default device not available")
+
+    return sd.OutputStream(device=output_device_index, channels=1, samplerate=SAMPLE_RATE, callback=self.callback, blocksize=SAMPLE_BUFFER)
+
+  def soundd_thread(self):
+    # sounddevice must be imported after forking processes
+    import sounddevice as sd
+
+    sm = messaging.SubMaster(['selfdriveState', 'selfdriveStateSP', 'soundPressure'])
+
+    with self.get_stream(sd) as stream:
+      rk = Ratekeeper(20)
+
+      cloudlog.info(f"soundd stream started: {stream.samplerate=} {stream.channels=} {stream.dtype=} {stream.device=}, {stream.blocksize=}")
+      while True:
+        sm.update(0)
+
+        self.load_param()
+
+        # Always update volume, even when alert is playing
+        if sm.updated['soundPressure']:
+          self.spl_filter_weighted.update(sm["soundPressure"].soundPressureWeightedDb)
+          self.current_volume = self.calculate_volume(float(self.spl_filter_weighted.x))
+
+        self.get_audible_alert(sm)
+
+        # Ramp up immediate warning sound over 4s
+        if self.current_alert == AudibleAlert.warningImmediate:
+          elapsed = time.monotonic() - self.ramp_start_time
+          ramp_vol = float(np.interp(elapsed, [0, ALERT_RAMP_TIME], [self.ramp_start_volume, MAX_VOLUME]))
+          self.current_volume = max(self.current_volume, ramp_vol)
+
+        rk.keep_time()
+
+        assert stream.active
+
+
+def main():
+  s = Soundd()
+  s.soundd_thread()
+
+
+if __name__ == "__main__":
+  main()
     self.ramp_start_volume = MIN_VOLUME
     self.ramp_start_time = 0.
 
