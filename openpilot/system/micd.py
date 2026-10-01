@@ -4,7 +4,7 @@ from functools import cache
 import threading
 import time
 
-from cereal import messaging
+from openpilot.cereal import messaging
 from openpilot.common.realtime import Ratekeeper
 from openpilot.common.utils import retry
 from openpilot.common.swaglog import cloudlog
@@ -15,6 +15,13 @@ REFERENCE_SPL = 2e-5  # newtons/m^2
 SAMPLE_RATE = 16000
 SAMPLE_BUFFER = 800  # 50ms
 
+
+def patch_sounddevice(sd):
+  # TODO: remove once sounddevice uses np.reshape internally.
+  def sounddevice_array(buffer, channels, dtype):
+    return np.frombuffer(buffer, dtype=dtype).reshape(-1, channels)
+
+  sd._array = sounddevice_array
 
 @cache
 def get_a_weighting_filter():
@@ -130,6 +137,7 @@ class Mic:
   def micd_thread(self):
     # sounddevice must be imported after forking processes
     import sounddevice as sd
+    patch_sounddevice(sd)
 
     with self.get_stream(sd) as stream:
       cloudlog.info(f"micd stream started: {stream.samplerate=} {stream.channels=} {stream.dtype=} {stream.device=}, {stream.blocksize=}")
